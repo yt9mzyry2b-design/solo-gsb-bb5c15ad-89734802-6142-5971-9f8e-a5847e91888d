@@ -1,4 +1,4 @@
-"""Hand-written OpenAPI surface for the /commit and /verify endpoints.
+"""Hand-written OpenAPI surface for the /commit, /verify, /diff and /patch endpoints.
 
 Both routes deliberately accept a raw JSON :class:`fastapi.Request` (so they
 can return the documented precise ``loc`` errors instead of Pydantic 422s),
@@ -225,6 +225,68 @@ class DiffResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# RFC 6902 style JSON Patch
+# ---------------------------------------------------------------------------
+
+
+class PatchOperation(BaseModel):
+    op: Literal["add", "remove", "replace"] = Field(
+        ...,
+        description=(
+            "RFC 6902 operation. `add` inserts an object member or array "
+            "element (the '-' token appends after the last element), "
+            "`remove` deletes an existing member/element, `replace` "
+            "overwrites an existing location or, for the empty pointer, "
+            "the whole document."
+        ),
+    )
+    path: str = Field(
+        ...,
+        description=(
+            "RFC 6901 JSON Pointer to the target location. The last token "
+            "may be '-' for `add` on an array; '' addresses the document "
+            "root."
+        ),
+    )
+    value: Optional[Any] = Field(
+        None,
+        description=(
+            "Required for `add` and `replace`; forbidden for `remove`. Any "
+            "valid JSON value (scalar, object or array)."
+        ),
+    )
+
+
+class PatchRequest(BaseModel):
+    document: Any = Field(
+        ...,
+        description="The JSON document to patch; it is never mutated in place.",
+    )
+    operations: List[PatchOperation] = Field(
+        ...,
+        description=(
+            "Operations applied strictly in array order. All operations are "
+            "validated first and then applied to a deep copy: if any "
+            "operation has an invalid path, parent container or array "
+            "index, the whole request fails with loc `operations[i]` and no "
+            "partial result is returned."
+        ),
+    )
+
+
+class PatchResponse(BaseModel):
+    document: Any = Field(..., description="The patched JSON document.")
+    changedPaths: List[str] = Field(
+        ...,
+        description=(
+            "RFC 6901 pointers touched by the operations (a '-' append token "
+            "is reported as the concrete new index), de-duplicated and "
+            "sorted by pointer."
+        ),
+    )
+
+
 class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
@@ -296,6 +358,9 @@ def install_openapi(app: FastAPI) -> None:
                 CompactVerifyResponse,
                 DiffRequest,
                 DiffResponse,
+                PatchOperation,
+                PatchRequest,
+                PatchResponse,
                 ErrorResponse,
             )
         )
@@ -510,6 +575,72 @@ def install_openapi(app: FastAPI) -> None:
                                         "beforeFingerprint": "02" * 32,
                                         "afterFingerprint": "03" * 32,
                                     },
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/patch"] = {
+            "post": {
+                "summary": "Apply ordered RFC 6902 add/remove/replace operations",
+                "description": (
+                    "Applies an ordered list of RFC 6902 style patch "
+                    "operations (only `add`, `remove` and `replace`) to a "
+                    "deep copy of `document`. Paths are RFC 6901 pointers "
+                    "into objects and arrays; the last array token may be "
+                    "`-` to append. Every operation is validated up front "
+                    "and then applied in order: an invalid pointer, a "
+                    "missing parent container, an array index out of range, "
+                    "a remove/replace of a missing location or an "
+                    "unsupported operation fails the whole request with a "
+                    "single `operations[i]`-located error and no partial "
+                    "result is returned. On success the response contains "
+                    "the patched document and `changedPaths`: the touched "
+                    "RFC 6901 pointers (with `-` expanded to the concrete "
+                    "new index), de-duplicated and sorted by pointer."
+                ),
+                "operationId": "patch",
+                "requestBody": _json_content(
+                    _ref("PatchRequest"),
+                    example={
+                        "document": {
+                            "name": "Ada",
+                            "age": 36,
+                            "emails": ["ada@example.com"],
+                        },
+                        "operations": [
+                            {"op": "replace", "path": "/age", "value": 37},
+                            {"op": "add", "path": "/emails/-",
+                             "value": "ada@analytical.engine"},
+                            {"op": "add", "path": "/role", "value": "engineer"},
+                            {"op": "remove", "path": "/emails/0"},
+                        ],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "All operations applied successfully to a copy "
+                            "of the document."
+                        ),
+                        **_json_content(
+                            _ref("PatchResponse"),
+                            example={
+                                "document": {
+                                    "name": "Ada",
+                                    "age": 37,
+                                    "emails": ["ada@analytical.engine"],
+                                    "role": "engineer",
+                                },
+                                "changedPaths": [
+                                    "/age",
+                                    "/emails/0",
+                                    "/emails/1",
+                                    "/role",
                                 ],
                             },
                         ),
