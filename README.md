@@ -170,6 +170,40 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 `PATH_NOT_FOUND`；重复项返回 `DUPLICATE_PATH`（`loc` 指向后出现的
 `paths[i]`）。省略 `paths` 比较所有叶；显式传 `[]` 表示不选择任何路径。
 
+### 8. RFC 6902 风格补丁（`POST /patch`）
+
+`/patch` 接收一份 `document` 与按数组顺序排列的 `operations`，在文档的**深拷贝**上逐项
+执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) 风格操作，支持三种 `op`：
+
+| `op` | 对象成员 | 数组元素 |
+| --- | --- | --- |
+| `add` | 成员不存在则新增，**已存在则替换其值** | 在指定下标前插入；`-` 或下标 `length` 表示末尾追加 |
+| `remove` | 删除已存在的成员 | 删除已存在的元素，后续元素前移 |
+| `replace` | 覆盖**已存在**成员的值 | 覆盖**已存在**下标的元素 |
+
+规则细节：
+
+- `path` 是 RFC 6901 指针（`~0`/`~1` 转义规则相同）；数组下标必须是无前导零的十进制
+  整数（`"0"` 合法，`"01"` 非法）；
+- `-` 是 RFC 6902 的数组末尾记号，**仅允许用于 `add`**；`remove`/`replace` 使用 `-`
+  或越界下标都返回 `PATH_NOT_FOUND`；
+- `add`/`replace` 必须携带 `value`（可以是任意 JSON 值，含嵌套容器，会经过与其他接口
+  相同的 JSON 值校验）；`remove` 不接受 `value`（多余字段会被忽略）；
+- 空指针 `""` 表示整个文档：允许 `add`/`replace`（替换根值）；`remove` 根文档无意义，
+  返回 `INVALID_REQUEST`；
+- 操作严格按顺序执行——后一操作的路径是否合法，取决于前一操作执行后的文档状态；
+- **先完整校验、再整体生效**：所有操作的结构（类型、`op`、指针语法、必填字段）先于
+  任何修改完成校验；执行阶段任一项的路径、父容器或数组下标非法，整份请求失败，
+  错误统一为 `{error: {code, message, loc, detail?}}`，其中 `loc` 精确定位到
+  `operations[i]`（结构字段错误为 `operations[i].op` / `.path` / `.value`），
+  响应不包含 `document`/`changedPaths`，输入文档不被修改。
+
+成功响应包含补丁后的 `document` 与 `changedPaths`：后者按与 `/commit`、`/diff` 相同的
+叶模型计算两侧叶路径的差异——被删除的叶、新增的叶、两侧都存在但**规范 JSON 值不同**
+的叶（`1`→`1.0` 视为变化）——并按 RFC 6901 指针字符串排序。补丁在规范意义上没有改变
+文档时（例如以相同值 `replace`），`changedPaths` 为空数组；`operations` 为空数组
+时原样返回文档且 `changedPaths` 为 `[]`。
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -332,6 +366,55 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 } }
 ```
 
+### `POST /patch` — 顺序执行 RFC 6902 补丁
+
+请求（`operations` 按数组顺序执行；数组可用下标插入或用 `-` 追加）：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 36 },
+    "emails": ["ada@example.com"],
+    "role": null
+  },
+  "operations": [
+    { "op": "replace", "path": "/subject/age", "value": 37 },
+    { "op": "add", "path": "/emails/-", "value": "ada@analytical.engine" },
+    { "op": "add", "path": "/subject/title", "value": "Countess" },
+    { "op": "remove", "path": "/role" }
+  ]
+}
+```
+
+成功（`200`）：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 37, "title": "Countess" },
+    "emails": ["ada@example.com", "ada@analytical.engine"]
+  },
+  "changedPaths": [
+    "/emails/1",
+    "/role",
+    "/subject/age",
+    "/subject/title"
+  ]
+}
+```
+
+非法路径/父容器/数组下标时，整份请求失败且不返回任何补丁结果，`loc` 指向出错的
+操作（先做结构校验，再按顺序执行，任何一步失败都不会产生部分结果）：
+
+```json
+{ "error": {
+    "code": "PATH_NOT_FOUND",
+    "message": "array index 5 out of range for 'replace' (length 1)",
+    "loc": "operations[2]",
+    "detail": { "path": "/emails/5" }
+} }
+```
+
 ### `POST /verify` — 无原文校验
 
 请求体只需提交方给你的根与所选披露：
@@ -404,11 +487,11 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON、含重复对象键 |
 | 400 | `INVALID_REQUEST` | 缺字段、类型错误 |
 | 400 | `POINTER_SYNTAX` | 指针非法（如尾随 `~`、不以 `/` 开头） |
-| 400 | `PATH_NOT_FOUND` | 文档中不存在该路径（含数组越界） |
+| 400 | `PATH_NOT_FOUND` | 文档中不存在该路径（含数组越界、`remove`/`replace` 命中不存在的成员、对 `-` 做非 `add` 操作等） |
 | 400 | `PATH_NOT_LEAF` | 路径是非空容器（`/commit` 的 `reveal` 或 `/diff` 的 `paths`）；`detail.leafChildren` 给出可选的叶路径 |
 | 400 | `DUPLICATE_PATH` | 同一指针重复提交 |
 | 400 | `EMPTY_REVEAL` | 披露列表为空 |
-| 400 | `UNSUPPORTED_VALUE` | `NaN`/`Infinity`、孤立代理项等 |
+| 400 | `UNSUPPORTED_VALUE` | `NaN`/`Infinity`、孤立代理项等（含 `/patch` 的 `operations[i].value`） |
 | 400 | `BAD_HASH_ENCODING` | 根或兄弟哈希不是 64 位十六进制 |
 | 400 | `BAD_PROOF` | 证明结构错误：标准格式 side 非法、兄弟长度不对；紧凑格式叶/节点下标越界或重复、节点缺失或多余、携带奇数层末节点等（均有精确 `loc`） |
 | 413 | `PAYLOAD_TOO_LARGE` | 请求体超过 `MAX_BODY_BYTES` |
@@ -418,6 +501,7 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 
 - `GET /healthz` → `{"status":"ok"}`
 - `POST /diff` → 叶级 added/removed/changed 变更报告
+- `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -443,6 +527,16 @@ curl -s localhost:8000/diff -H 'content-type: application/json' -d '{
   "paths": ["/subject/age", "/subject/added"]
 }'
 
+# 4b) 按顺序执行 RFC 6902 add/remove/replace 补丁；- 表示数组末尾
+curl -s localhost:8000/patch -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["ada@x"]},
+  "operations": [
+    {"op": "replace", "path": "/subject/age", "value": 37},
+    {"op": "add", "path": "/emails/-", "value": "ada@engine"},
+    {"op": "remove", "path": "/subject/name"}
+  ]
+}'
+
 # 5) 紧凑多叶证明：加 "proofMode": "compact"，返回 leafCount、
 #    每个叶的 index，以及按 (level,index) 去重的 proofNodes
 curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
@@ -458,7 +552,7 @@ curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q          # 90+ 个测试
+python3 -m pytest -q          # 120+ 个测试
 python3 -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -466,16 +560,17 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
+  patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
-  openapi.py     # 两种证明格式的 OpenAPI 模型与文档合并
+  openapi.py     # 两种证明格式与 /diff、/patch 的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
-tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重与结构错误场景）
+tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与补丁场景）
 Dockerfile
 docker-entrypoint.sh   # 启动时安装依赖并启动 uvicorn
 docker-compose.yml

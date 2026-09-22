@@ -225,6 +225,65 @@ class DiffResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# RFC 6902-style JSON patch
+# ---------------------------------------------------------------------------
+
+
+class PatchOperation(BaseModel):
+    op: Literal["add", "remove", "replace"] = Field(
+        ...,
+        description=(
+            "RFC 6902 operation kind. `add` inserts an array element (or "
+            "appends with the '-' end token) / sets an object member "
+            "(replacing an existing one); `remove` deletes an existing "
+            "member or element; `replace` overwrites an existing value."
+        ),
+    )
+    path: str = Field(
+        ...,
+        description=(
+            "RFC 6901 pointer to the target. Array tokens are zero-based "
+            "indices without leading zeros; '-' addresses the end of an "
+            "array and is only valid for `add`."
+        ),
+    )
+    value: Optional[Any] = Field(
+        None,
+        description=(
+            "The new value for `add`/`replace` (required for both); absent "
+            "for `remove`. May be any JSON value, including a nested "
+            "container."
+        ),
+    )
+
+
+class PatchRequest(BaseModel):
+    document: Any = Field(..., description="The JSON document to patch.")
+    operations: List[PatchOperation] = Field(
+        ...,
+        description=(
+            "RFC 6902 operations applied in array order to a deep copy of "
+            "`document`. Every operation is validated before any result is "
+            "returned: an invalid path, parent container or array index in "
+            "any operation fails the whole request with no partial result."
+        ),
+    )
+
+
+class PatchResponse(BaseModel):
+    document: Any = Field(..., description="The patched JSON document.")
+    changedPaths: List[str] = Field(
+        ...,
+        description=(
+            "RFC 6901 leaf paths that differ from the input document — "
+            "removed leaves, added leaves and leaves whose canonical value "
+            "changed — sorted by pointer. An operation that leaves the "
+            "canonical document unchanged contributes no paths."
+        ),
+    )
+
+
 class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
@@ -296,6 +355,9 @@ def install_openapi(app: FastAPI) -> None:
                 CompactVerifyResponse,
                 DiffRequest,
                 DiffResponse,
+                PatchOperation,
+                PatchRequest,
+                PatchResponse,
                 ErrorResponse,
             )
         )
@@ -510,6 +572,79 @@ def install_openapi(app: FastAPI) -> None:
                                         "beforeFingerprint": "02" * 32,
                                         "afterFingerprint": "03" * 32,
                                     },
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/patch"] = {
+            "post": {
+                "summary": "Apply ordered RFC 6902 add/remove/replace operations",
+                "description": (
+                    "Applies the operations in array order to a deep copy of "
+                    "`document` using RFC 6901 pointer paths and RFC 6902 "
+                    "array semantics: `add` inserts before an index or "
+                    "appends with '-' (object members are replaced if they "
+                    "already exist); `remove` and `replace` require the "
+                    "target to exist; leading-zero indices are invalid. The "
+                    "request is validated as one atomic unit — an invalid "
+                    "path, parent container or array index in any operation "
+                    "fails with a `loc` of `operations[i]` (or one of its "
+                    "fields) and no partial result is returned. On success "
+                    "the response carries the patched document plus "
+                    "`changedPaths`: the leaf paths (same leaf rules as "
+                    "/commit) that were added, removed or canonically "
+                    "changed, sorted by RFC 6901 pointer."
+                ),
+                "operationId": "patch",
+                "requestBody": _json_content(
+                    _ref("PatchRequest"),
+                    example={
+                        "document": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "emails": ["ada@example.com"],
+                            "role": None,
+                        },
+                        "operations": [
+                            {"op": "replace", "path": "/subject/age",
+                             "value": 37},
+                            {"op": "add", "path": "/emails/-",
+                             "value": "ada@analytical.engine"},
+                            {"op": "add", "path": "/subject/title",
+                             "value": "Countess"},
+                            {"op": "remove", "path": "/role"},
+                        ],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "Patched document and RFC 6901-sorted changed "
+                            "leaf paths."
+                        ),
+                        **_json_content(
+                            _ref("PatchResponse"),
+                            example={
+                                "document": {
+                                    "subject": {
+                                        "name": "Ada",
+                                        "age": 37,
+                                        "title": "Countess",
+                                    },
+                                    "emails": [
+                                        "ada@example.com",
+                                        "ada@analytical.engine",
+                                    ],
+                                },
+                                "changedPaths": [
+                                    "/emails/1",
+                                    "/role",
+                                    "/subject/age",
+                                    "/subject/title",
                                 ],
                             },
                         ),

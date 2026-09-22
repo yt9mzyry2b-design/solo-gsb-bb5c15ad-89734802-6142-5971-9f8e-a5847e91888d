@@ -12,6 +12,9 @@ POST /verify   check disclosures against a previously committed root without
                detected automatically.
 POST /diff     compare two documents at their RFC 6901 leaf paths and report
                added, removed and changed canonical values.
+POST /patch    apply an ordered list of RFC 6902 operations (add, remove,
+               replace) to a deep copy of a document; returns the patched
+               document together with the sorted changed leaf paths.
 GET  /healthz  liveness probe.
 GET  /         service metadata.
 """
@@ -28,6 +31,7 @@ from fastapi.responses import JSONResponse
 from . import pointers
 from .canonical import CanonicalError
 from .diff import diff_documents
+from .patch import apply_patch
 from .errors import (
     ApiError,
     BAD_HASH_ENCODING,
@@ -74,7 +78,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -447,6 +451,28 @@ async def diff_documents_endpoint(request: Request) -> Dict[str, Any]:
         )
 
     return diff_documents(before, after, selected_paths)
+
+
+# ---------------------------------------------------------------------------
+# POST /patch
+# ---------------------------------------------------------------------------
+
+
+@app.post("/patch")
+async def patch_document_endpoint(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    document = _get_field(body, "document", "document")
+    validate_json_value(document, loc="document")
+    operations = _get_field(body, "operations", "operations")
+
+    return apply_patch(document, operations)
 
 
 # ---------------------------------------------------------------------------
@@ -955,11 +981,12 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
             "diff": "POST /diff",
+            "patch": "POST /patch",
             "docs": "GET /docs",
             "health": "GET /healthz",
         },

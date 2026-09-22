@@ -50,8 +50,14 @@ def parse_pointer(pointer: str) -> Tuple[str | int, ...]:
     return tuple(tokens)
 
 
-def _decode_array_index(token: str) -> int | None:
-    """Return the array index for *token*, or ``None`` if it is not one."""
+def decode_array_index(token: str) -> int | None:
+    """Return the array index for *token*, or ``None`` if it is not one.
+
+    Per RFC 6901/6902 the leading-zero forms ``"01"`` (and anything that is
+    not ``"0"`` followed by digits) are not array indices; the array-end
+    token ``"-"`` is not decoded here either — it is meaningful only for the
+    RFC 6902 ``add`` operation and handled by :mod:`app.patch`.
+    """
     if token == "0":
         return 0
     if token.isdigit() and not token.startswith("0"):
@@ -75,7 +81,7 @@ def resolve(doc: Any, tokens: Tuple[str | int, ...]) -> Any:
                 )
             current = current[token]
         elif isinstance(current, list):
-            idx = _decode_array_index(str(token))
+            idx = decode_array_index(str(token))
             if idx is None:
                 raise IndexError(
                     f"token {token!r} is not a valid array index "
